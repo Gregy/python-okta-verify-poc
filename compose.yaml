@@ -1,0 +1,11 @@
+services:
+  okta-poc:
+    build: .
+    image: okta-poc:local
+    stdin_open: true
+    tty: true
+    volumes:
+      - okta-poc-data:/data
+
+volumes:
+  okta-poc-data:

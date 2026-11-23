@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "okta-poc"
+version = "0.1.0"
+description = "Experimental independent Okta Verify client with polling and FCM push modes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42,<47",
+  "PyJWT>=2.10,<3",
+  "requests>=2.32,<3",
+  "opencv-python-headless>=4.8,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+okta-poc = "okta_poc.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/okta_poc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

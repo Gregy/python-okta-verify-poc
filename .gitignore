@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.env
+.env.*
+live-captures/
+fcm-receiver/**/target
+*.jws
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+.DS_Store
+
+# Enrollment QR screenshots (contain activation tokens)
+/*.png
+/*.jpg
