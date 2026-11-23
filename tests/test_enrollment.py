@@ -1,243 +1,130 @@
 from __future__ import annotations
 
-import json
-from dataclasses import replace
-
 import jwt
 import pytest
 
-from okta_poc.crypto import generate_rsa_key, private_key
-from okta_poc.enrollment import (
-    delete_enrollment,
-    discover,
-    enrollment_body,
-    new_preparation,
-    parse_enrollment_response,
-    update_enrollment,
-)
-from okta_poc.errors import ApiError, PolicyError, ValidationError
-from okta_poc.http import HttpResponse
-from okta_poc.models import EnrollmentRecord
+from okta_poc.enrollment import auth_assertion, delete, discover, enroll, update_push_token
+from okta_poc.errors import ApiError, PoCError
 from tests.helpers import (
-    NOW,
     ORG,
     FakeHttp,
     activation,
-    discovery,
     enrollment,
     enrollment_response,
     organization_response,
+    policy,
     policy_response,
-    preparation,
 )
 
 
-def test_discovery_exact_request_and_response_persistence():
-    http = FakeHttp(gets=[organization_response(), policy_response(ciba=True)])
-    result = discover(activation(), http)
-    assert result.org_id == "00o_org"
-    assert result.expected_audience == "0oa_client"
-    assert result.policy_supports_ciba is True
-    assert http.calls[0] == {
-        "method": "GET",
-        "url": ORG + "/.well-known/okta-organization",
-        "headers": {},
-        "expected": (200,),
-    }
+def _claims(token: str, key) -> dict:
+    return jwt.decode(token, key._private().public_key(), algorithms=["RS256"], audience=ORG)
+
+
+def test_discover_requests_and_policy():
+    http = FakeHttp(organization_response(), policy_response(ciba=True))
+    result = discover(activation(), http, allow_missing_audience=False)
+    assert result == policy(ciba=True)
+    assert http.calls[0]["url"] == ORG + "/.well-known/okta-organization"
     assert http.calls[1]["url"] == ORG + "/api/v1/authenticators?key=okta_verify&expand=methods"
-    assert http.calls[1]["headers"] == {"Authorization": "OTDT TEST_ACTIVATION_TOKEN"}
-
-    prep = preparation(ciba=True)
-    body = enrollment_body(prep, "REAL_FCM_TOKEN")
-    assert body["key"] == "okta_verify"
-    assert body["authenticatorId"] == "aut_example"
-    assert isinstance(body["methods"], list)
-    method = body["methods"][0]
-    assert method["type"] == "push"
-    assert method["pushToken"] == "REAL_FCM_TOKEN"
-    assert method["capabilities"] == {"transactionTypes": ["LOGIN"]}
-    assert method["keys"]["proofOfPossession"] == prep.pop_key.public_jwk
-    assert "supportUserVerification" not in method
-    assert body["device"]["clientInstanceKey"] == prep.client_instance_key.public_jwk
-    assert body["device"]["deviceAttestation"] == {}
-    assert "fullDiskEncryption" not in body["device"]
-    assert "rootPrivileges" not in body["device"]
-
-    record = parse_enrollment_response(enrollment_response(), prep)
-    assert record.enrollment_id == "enrollment-id"
-    assert record.method_enrollment_id == "push-method-id"
-    assert record.pending_challenge_uri == ORG + "/api/v1/factors/device-id/lifecycle/pending"
-    assert record.expected_audience == "0oa_client"
+    assert http.calls[1]["auth"] == "OTDT TEST_ACTIVATION_TOKEN"
 
 
-def test_no_ciba_omits_capabilities_and_missing_token_is_not_dummy():
-    body = enrollment_body(preparation(ciba=False), None)
-    method = body["methods"][0]
-    assert "capabilities" not in method
-    assert "pushToken" not in method
-
-
-def test_missing_policy_audience_requires_explicit_opt_in():
-    policy = policy_response()
-    del policy[0]["settings"]["oauthClientId"]
-    with pytest.raises(PolicyError, match="allow-missing-policy-audience"):
-        discover(activation(), FakeHttp(gets=[organization_response(), policy]))
-    result = discover(
-        activation(),
-        FakeHttp(gets=[organization_response(), policy]),
-        allow_missing_audience=True,
-    )
+def test_missing_policy_audience_needs_explicit_opt_in():
+    with pytest.raises(PoCError, match="oauthClientId"):
+        discover(activation(), FakeHttp(organization_response(), policy_response(audience=None)), allow_missing_audience=False)
+    result = discover(activation(), FakeHttp(organization_response(), policy_response(audience=None)), allow_missing_audience=True)
     assert result.expected_audience is None
 
 
-def test_policy_requires_exactly_one_active_policy():
-    http = FakeHttp(gets=[organization_response(), []])
-    with pytest.raises(PolicyError, match="exactly one"):
-        discover(activation(), http)
+def test_hardware_key_policy_is_refused():
+    http = FakeHttp(organization_response(), policy_response(protection="HARDWARE"))
+    with pytest.raises(PoCError, match="hardware"):
+        discover(activation(), http, allow_missing_audience=False)
 
 
-def test_pre_enrollment_inactive_push_requires_activation_link():
-    policy = policy_response()
-    push = policy[0]["_embedded"]["methods"][0]
-    push["status"] = "INACTIVE"
-    with pytest.raises(ValidationError, match="activation"):
-        discover(
-            activation(),
-            FakeHttp(gets=[organization_response(), policy]),
-        )
-    push["_links"] = {"activate": {"href": ORG + "/api/v1/authenticators/aut_example/methods/push/lifecycle/activate"}}
-    result = discover(
-        activation(),
-        FakeHttp(gets=[organization_response(), policy]),
-    )
-    assert result.authenticator_id == "aut_example"
-
-
-def test_hardware_policy_is_not_bypassed():
-    http = FakeHttp(gets=[organization_response(), policy_response(protection="HARDWARE")])
-    with pytest.raises(PolicyError, match="hardware keys"):
-        discover(activation(), http)
-
-
-def test_enrollment_accepts_omitted_method_status_but_rejects_inactive():
-    prep = preparation()
-    response = enrollment_response()
-    del response["methods"][0]["status"]
-    record = parse_enrollment_response(response, prep)
-    assert record.method_enrollment_id == "push-method-id"
-    response["methods"][0]["status"] = "INACTIVE"
-    with pytest.raises(ValidationError, match="INACTIVE"):
-        parse_enrollment_response(response, prep)
-
-
-def test_default_android_profile_has_no_hardware_or_attestation_claims():
-    prep = new_preparation(
-        discovery(),
-        jwk_profile="canonical",
-        display_name="Android Compatibility Test",
-    )
-    body = enrollment_body(prep, "REAL_FCM_TOKEN")
+def test_enroll_request_body_and_record():
+    http = FakeHttp(enrollment_response())
+    record = enroll(policy(ciba=True), activation(), http, push_token="FCM_TOKEN", with_uv=True, display_name="Box")
+    call = http.calls[0]
+    assert (call["method"], call["url"], call["auth"]) == ("POST", ORG + "/idp/authenticators", "OTDT TEST_ACTIVATION_TOKEN")
+    body = call["body"]
+    assert body["key"] == "okta_verify" and body["authenticatorId"] == "aut_example"
     device = body["device"]
-    assert device["platform"] == "ANDROID"
-    assert device["osVersion"] == "32"
-    assert device["clientInstanceBundleId"] == "com.okta.android.auth"
-    assert device["clientInstanceVersion"] == "9.10.0"
-    assert device["clientInstanceDeviceSdkVersion"] == "9.10.0"
-    assert "model" not in device
-    assert "secureHardwarePresent" not in device
-    assert "screenLockType" not in device
-    assert "diskEncryptionType" not in device
+    assert device["platform"] == "ANDROID" and device["clientInstanceVersion"] == "9.10.0"
+    assert device["displayName"] == "Box"
     assert device["deviceAttestation"] == {}
-    assert device["clientInstanceKey"]["okta:kpr"] == "SOFTWARE"
+    assert device["clientInstanceKey"] == record.client_instance_key.public_jwk()
+    assert "model" not in device
+    method = body["methods"][0]
+    assert method["pushToken"] == "FCM_TOKEN"
+    assert method["capabilities"] == {"transactionTypes": ["LOGIN"]}
+    assert method["keys"] == {
+        "proofOfPossession": record.pop_key.public_jwk(),
+        "userVerification": record.uv_key.public_jwk(),
+    }
+    assert record.enrollment_id == "enrollment-id"
+    assert record.method_enrollment_id == "push-method-id"
+    assert record.pending_challenge_uri == ORG + "/api/v1/factors/device-id/lifecycle/pending"
 
 
-def test_initial_uv_enrollment_includes_stable_uv_key():
-    policy = replace(discovery(), policy_user_verification="REQUIRED")
-    prep = new_preparation(policy, jwk_profile="canonical", display_name="UV Host", with_uv=True)
-    assert prep.uv_key is not None
-    body = enrollment_body(prep, "REAL_FCM_TOKEN")
-    keys = body["methods"][0]["keys"]
-    assert keys["userVerification"] == prep.uv_key.public_jwk
-    assert keys["proofOfPossession"] == prep.pop_key.public_jwk
-    record = parse_enrollment_response(enrollment_response(), prep)
-    assert record.uv_enrolled is True
-    restored = EnrollmentRecord.from_dict(record.to_dict())
-    assert restored.uv_key.kid == prep.uv_key.kid
-    assert restored.uv_enrolled is True
+def test_enroll_without_push_or_ciba_omits_them():
+    http = FakeHttp(enrollment_response())
+    record = enroll(policy(), activation(), http, push_token=None, with_uv=False, display_name="Box")
+    method = http.calls[0]["body"]["methods"][0]
+    assert "pushToken" not in method and "capabilities" not in method
+    assert record.uv_key is None
 
 
-def test_uv_enrollment_update_preserves_identity_and_exact_ssws_profile():
+@pytest.mark.parametrize("change", [
+    {"status": "INACTIVE"},
+    {"authenticatorId": "other"},
+    {"methods": []},
+    {"methods": [{"type": "push", "id": "m", "status": "INACTIVE"}]},
+    {"methods": [{"type": "push", "id": "m", "links": {"pending": {"href": "https://evil.example/p"}}}]},
+])
+def test_enroll_rejects_bad_responses(change):
+    with pytest.raises(PoCError):
+        enroll(policy(), activation(), FakeHttp({**enrollment_response(), **change}),
+               push_token=None, with_uv=False, display_name="Box")
+
+
+def test_auth_assertion_claims():
     record = enrollment()
-    record.uv_key = generate_rsa_key(profile=record.jwk_profile)
-    response_value = enrollment_response()
-    del response_value["methods"][0]["status"]
-    http = FakeHttp(puts=[HttpResponse(200, {}, json.dumps(response_value).encode())])
-    updated = update_enrollment(record, http, push_token="REAL_FCM_TOKEN", now=NOW)
-    call = http.calls[0]
-    assert call["method"] == "PUT"
-    assert call["url"] == ORG + "/idp/authenticators/enrollment-id"
-    assert call["expected"] == (200, 201)
-    assert call["body"]["device"]["id"] == record.device_id
-    assert call["body"]["device"]["clientInstanceId"] == record.client_instance_id
-    assert call["body"]["methods"][0]["supportUserVerification"] is True
-    assert call["body"]["methods"][0]["isFipsCompliant"] is False
-    keys = call["body"]["methods"][0]["keys"]
-    assert keys["proofOfPossession"] == record.pop_key.public_jwk
-    assert keys["userVerification"] == record.uv_key.public_jwk
-    scheme, assertion = call["headers"]["Authorization"].split(" ", 1)
+    scheme, token = auth_assertion(record, record.method_enrollment_id).split(" ")
     assert scheme == "SSWS"
-    claims = jwt.decode(
-        assertion,
-        private_key(record.pop_key).public_key(),
-        algorithms=["RS256"],
-        audience=record.org_url,
-        issuer=record.enrollment_id,
-        options={"verify_exp": False, "verify_nbf": False, "verify_iat": False},
-    )
+    assert jwt.get_unverified_header(token) == {"alg": "RS256", "kid": record.pop_key.kid, "typ": "okta-enrollmentupdate+jwt"}
+    claims = _claims(token, record.pop_key)
+    assert claims["iss"] == record.method_enrollment_id and claims["sub"] == "user-id"
     assert claims["kid"] == record.pop_key.kid
-    assert claims["exp"] == NOW + 300 and claims["nbf"] == NOW - 300
-    assert updated.uv_enrolled is True
-    assert updated.method_enrollment_id == record.method_enrollment_id
+    assert claims["exp"] - claims["iat"] == 300 and claims["iat"] - claims["nbf"] == 300
 
 
-def test_delete_enrollment_exact_request_and_idempotent_not_found():
+def test_update_push_token_keeps_identity():
+    record = enrollment(with_uv=True)
+    http = FakeHttp(enrollment_response())
+    update_push_token(record, http, "NEW_TOKEN")
+    call = http.calls[0]
+    assert (call["method"], call["url"]) == ("PUT", ORG + "/idp/authenticators/enrollment-id")
+    assert _claims(call["auth"].split(" ")[1], record.pop_key)["iss"] == "enrollment-id"
+    assert call["body"]["device"]["id"] == "device-id"
+    assert call["body"]["device"]["clientInstanceId"] == "client-instance-id"
+    method = call["body"]["methods"][0]
+    assert method["pushToken"] == "NEW_TOKEN"
+    assert method["supportUserVerification"] is True and method["isFipsCompliant"] is False
+    assert method["keys"]["proofOfPossession"] == record.pop_key.public_jwk()
+
+    changed = enrollment_response()
+    changed["methods"][0]["id"] = "another-method"
+    with pytest.raises(PoCError, match="identity"):
+        update_push_token(record, FakeHttp(changed), "NEW_TOKEN")
+
+
+def test_delete_and_already_absent():
     record = enrollment()
-    http = FakeHttp(deletes=[HttpResponse(204, {}, b"")])
-    assert delete_enrollment(record, http, now=NOW) == "deleted"
-    call = http.calls[0]
-    assert call["method"] == "DELETE"
-    assert call["url"] == ORG + "/idp/authenticators/enrollment-id"
-    assert call["expected"] == (200, 204)
-    assert call["body"] is None
-    scheme, assertion = call["headers"]["Authorization"].split(" ", 1)
-    assert scheme == "SSWS"
-    claims = jwt.decode(
-        assertion,
-        private_key(record.pop_key).public_key(),
-        algorithms=["RS256"],
-        audience=record.org_url,
-        issuer=record.enrollment_id,
-        options={"verify_exp": False, "verify_nbf": False, "verify_iat": False},
-    )
-    assert claims["kid"] == record.pop_key.kid
-    assert claims["exp"] == NOW + 300 and claims["nbf"] == NOW - 300
-
-    absent = FakeHttp(deletes=[
-        ApiError(404, "not found", error_code="E0000007")
-    ])
-    assert delete_enrollment(record, absent, now=NOW) == "already absent"
-    rejected = FakeHttp(deletes=[ApiError(401, "unauthorized")])
-    with pytest.raises(ApiError, match="unauthorized"):
-        delete_enrollment(record, rejected, now=NOW)
-
-
-def test_enrollment_rejects_incomplete_or_foreign_response():
-    prep = preparation()
-    incomplete = enrollment_response()
-    del incomplete["device"]["clientInstanceId"]
-    with pytest.raises(ValidationError):
-        parse_enrollment_response(incomplete, prep)
-    foreign = enrollment_response()
-    foreign["methods"][0]["links"]["pending"]["href"] = "https://attacker.example/pending"
-    with pytest.raises(ValidationError, match="organization host"):
-        parse_enrollment_response(foreign, prep)
+    http = FakeHttp(None)
+    assert delete(record, http) == "deleted"
+    assert http.calls[0]["method"] == "DELETE"
+    assert delete(record, FakeHttp(ApiError(404, "gone", "E0000007"))) == "already absent"
+    with pytest.raises(ApiError):
+        delete(record, FakeHttp(ApiError(404, "other", "E0000001")))

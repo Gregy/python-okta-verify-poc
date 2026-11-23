@@ -1,332 +1,350 @@
+"""Receive Okta Verify push challenges by acting as an Android device on FCM.
+
+Okta sends pushes through Firebase Cloud Messaging (FCM) to the Okta Verify
+Android app. To receive them we do what the app + Google Play services do:
+
+1. Android check-in      -> device ID + security token from Google
+2. Firebase Installation -> auth token for Okta's Firebase project
+3. GCM register3         -> FCM registration token, sent to Okta at enrollment
+4. MCS connection        -> long-lived TLS socket to mtalk.google.com that
+                            delivers data messages (our challenges)
+
+Steps 1 and 4 use small hand-encoded protobuf messages. This is a port of the
+Android path of https://github.com/agusibrahim/fcm_receiver.rs, including the
+fixes needed for Okta's project (Android check-in, Installation before
+register3, PHONE_REGISTRATION_ERROR retries). Okta's pushes arrive as plain
+key/value app data, so no web-push decryption is needed.
+"""
+
 from __future__ import annotations
 
-import json
+import base64
 import os
-import re
-import signal
-import stat
-import subprocess
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Literal
+import socket
+import ssl
+import struct
+import time
+from collections.abc import Iterator
+from typing import Any
+from urllib.parse import parse_qs
 
-from .challenge import ValidatedChallenge
-from .errors import PolicyError, TransportError, ValidationError
+import requests
 
-Decision = Literal["approve", "deny", "skip", "quit"]
-_MAX_CHALLENGE = 64 * 1024
-_JWT_LIKE = re.compile(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
-_LONG_SECRET_LIKE = re.compile(r"\b[A-Za-z0-9_-]{40,}\b")
+from .errors import PoCError
+from .state import FcmDevice
+
+# Public Firebase client configuration of the Okta Verify Android app
+# (com.okta.android.auth). These identify the app, they are not Okta secrets.
+API_KEY = "AIzaSyDwy_6SVFbhzuHSzH5ld-Q-cnHJMHbGOac"
+APP_ID = "1:302730332600:android:fef22a316c6a55e7"
+PROJECT_ID = "okta-verify-2"
+SENDER_ID = "302730332600"
+PACKAGE = "com.okta.android.auth"
+# SHA-1 of the APK signing certificate (from the analyzed APK).
+PACKAGE_CERT = "d2dd7d391505aabbb7e35432019d4b84a39059a8"
+
+CHECKIN_URL = "https://android.clients.google.com/checkin"
+REGISTER_URL = "https://android.clients.google.com/c2dm/register3"
+INSTALLATIONS_URL = f"https://firebaseinstallations.googleapis.com/v1/projects/{PROJECT_ID}/installations"
+MCS_HOST, MCS_PORT = "mtalk.google.com", 5228
+FIREBASE_CLIENT = (
+    "android-min-sdk/23 fire-core/20.0.0 device-name/a21snnxx device-brand/samsung "
+    "device-model/a21s android-installer/com.android.vending fire-android/30 "
+    "fire-installations/17.0.0 fire-fcm/22.0.0 android-platform/ kotlin/1.9.23 "
+    "android-target-sdk/34"
+)
+
+# MCS protocol
+MCS_VERSION = 41
+TAG_HEARTBEAT_PING, TAG_HEARTBEAT_ACK, TAG_LOGIN_REQUEST, TAG_LOGIN_RESPONSE = 0, 1, 2, 3
+TAG_CLOSE, TAG_DATA_MESSAGE = 4, 8
+HEARTBEAT_SECONDS = 300
 
 
-def _executable(path_value: str | Path, label: str) -> Path:
-    path = Path(path_value).expanduser()
-    if not path.is_absolute():
-        raise ValidationError(f"{label} must be an absolute path")
+# --- Minimal protobuf encoding --------------------------------------------
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _pb_int(number: int, value: int) -> bytes:
+    return _varint(number << 3 | 0) + _varint(value)
+
+
+def _pb_fixed64(number: int, value: int) -> bytes:
+    return _varint(number << 3 | 1) + struct.pack("<Q", value)
+
+
+def _pb_bytes(number: int, value: bytes | str) -> bytes:
+    data = value.encode() if isinstance(value, str) else value
+    return _varint(number << 3 | 2) + _varint(len(data)) + data
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    result = shift = 0
+    while True:
+        if pos >= len(data):
+            raise PoCError("Truncated protobuf varint")
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def _pb_parse(data: bytes) -> dict[int, list[Any]]:
+    """Decode a protobuf message into {field number: [values]} (ints or bytes)."""
+
+    fields: dict[int, list[Any]] = {}
+    pos = 0
+    while pos < len(data):
+        key, pos = _read_varint(data, pos)
+        number, wire_type = key >> 3, key & 7
+        if wire_type == 0:
+            value, pos = _read_varint(data, pos)
+        elif wire_type == 1:
+            (value,), pos = struct.unpack_from("<Q", data, pos), pos + 8
+        elif wire_type == 2:
+            length, pos = _read_varint(data, pos)
+            value, pos = data[pos : pos + length], pos + length
+        elif wire_type == 5:
+            (value,), pos = struct.unpack_from("<I", data, pos), pos + 4
+        else:
+            raise PoCError(f"Unsupported protobuf wire type {wire_type}")
+        fields.setdefault(number, []).append(value)
+    return fields
+
+
+# --- Registration ------------------------------------------------------------
+
+
+class _PhoneRegistrationError(PoCError):
+    pass
+
+
+def _checkin(session: requests.Session) -> tuple[int, int]:
+    """Android check-in: returns (android_id, security_token)."""
+
+    body = (
+        _pb_int(2, 0)                        # id: 0 = new device
+        + _pb_bytes(4, _pb_int(12, 1))       # checkin { type: DEVICE_ANDROID_OS }
+        + _pb_fixed64(13, 0)                 # security_token
+        + _pb_int(14, 3)                     # version
+    )
+    response = session.post(
+        CHECKIN_URL, data=body, timeout=20,
+        headers={"Content-Type": "application/x-protobuf", "User-Agent": ""},
+    )
+    if response.status_code != 200:
+        raise PoCError(f"FCM check-in failed with HTTP {response.status_code}")
+    fields = _pb_parse(response.content)
     try:
-        resolved = path.resolve(strict=True)
-        if not resolved.is_file():
-            raise ValidationError(f"{label} is not a regular file")
-        if resolved.stat().st_mode & 0o002:
-            raise ValidationError(f"{label} must not be world-writable")
-    except OSError as exc:
-        raise ValidationError(f"{label} does not exist or cannot be accessed") from exc
-    if not os.access(resolved, os.X_OK):
-        raise ValidationError(f"{label} is not executable")
-    return resolved
+        return fields[7][0], fields[8][0]
+    except KeyError as exc:
+        raise PoCError("FCM check-in response has no device credentials") from exc
 
 
-def _terminate(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
+def _installation_token(session: requests.Session) -> str:
+    """Create a Firebase Installation; register3 for Okta's project requires its token."""
+
+    fid = bytearray(os.urandom(17))
+    fid[0] = 0b0111_0000 | (fid[0] & 0b0000_1111)  # FID format marker
+    response = session.post(
+        INSTALLATIONS_URL,
+        timeout=20,
+        json={
+            "fid": base64.b64encode(bytes(fid)).decode("ascii"),
+            "appId": APP_ID,
+            "authVersion": "FIS_v2",
+            "sdkVersion": "a:17.0.0",
+        },
+        headers={
+            "Accept": "application/json",
+            "x-goog-api-key": API_KEY,
+            "X-Android-Package": PACKAGE,
+            "X-Android-Cert": PACKAGE_CERT,
+            "x-firebase-client": FIREBASE_CLIENT,
+            "x-firebase-client-log-type": "3",
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A217F Build/RP1A.200720.012)",
+        },
+    )
+    if response.status_code != 200:
+        raise PoCError(f"Firebase Installation failed with HTTP {response.status_code}")
+    return response.json()["authToken"]["token"]
+
+
+def _register3(session: requests.Session, android_id: int, security_token: int, installation: str) -> str:
+    response = session.post(
+        REGISTER_URL,
+        timeout=20,
+        headers={"Authorization": f"AidLogin {android_id}:{security_token}", "User-Agent": ""},
+        data={
+            "X-subtype": SENDER_ID,
+            "sender": SENDER_ID,
+            "device": str(android_id),
+            "app": PACKAGE,
+            "cert": PACKAGE_CERT,
+            "app_ver": "1",
+            "X-app_ver": "1",
+            "X-app_ver_name": "1",
+            "X-osv": "29",
+            "X-cliv": "fiid-21.1.1",
+            "X-gmsv": "220217001",
+            "X-scope": "*",
+            "X-Goog-Firebase-Installations-Auth": installation,
+            "X-gms_app_id": APP_ID,
+            "X-Firebase-Client": FIREBASE_CLIENT,
+            "X-Firebase-Client-Log-Type": "1",
+            "target_ver": "31",
+        },
+    )
+    if response.status_code != 200:
+        raise PoCError(f"GCM register3 failed with HTTP {response.status_code}")
+    result = {name: values[0] for name, values in parse_qs(response.text).items()}
+    if result.get("Error") == "PHONE_REGISTRATION_ERROR":
+        raise _PhoneRegistrationError("PHONE_REGISTRATION_ERROR")
+    if "token" not in result:
+        raise PoCError(f"GCM register3 failed: {result.get('Error', 'no token')}")
+    return result["token"]
+
+
+def register_device(session: requests.Session | None = None, attempts: int = 8) -> FcmDevice:
+    """Register a new emulated Android device and return its FCM credentials."""
+
+    session = session or requests.Session()
+    android_id, security_token = _checkin(session)
+    installation = _installation_token(session)
+    for attempt in range(1, attempts + 1):
+        try:
+            token = _register3(session, android_id, security_token, installation)
+            print("FCM registration succeeded")
+            return FcmDevice(android_id=android_id, security_token=security_token, token=token)
+        except _PhoneRegistrationError:
+            # register3 often refuses a freshly checked-in device (~2 in 3 tries).
+            # Google Play services retries with backoff; halfway through we also
+            # start over with a new device in case this one is bad.
+            if attempt == attempts:
+                raise
+            print(f"FCM registration attempt {attempt}/{attempts}: PHONE_REGISTRATION_ERROR; retrying")
+            time.sleep(min(attempt, 4))
+            if attempt == attempts // 2:
+                android_id, security_token = _checkin(session)
+                installation = _installation_token(session)
+    raise AssertionError("unreachable")
+
+
+# --- Receiving -----------------------------------------------------------------
+
+
+def _login_packet(device: FcmDevice, received_ids: list[str]) -> bytes:
+    payload = (
+        _pb_bytes(1, "chrome-63.0.3234.0")
+        + _pb_bytes(2, "mcs.android.com")
+        + _pb_bytes(3, str(device.android_id))                   # user
+        + _pb_bytes(4, str(device.android_id))                   # resource
+        + _pb_bytes(5, str(device.security_token))               # auth_token
+        + _pb_bytes(6, f"android-{device.android_id:x}")          # device_id
+        + _pb_bytes(8, _pb_bytes(1, "new_vc") + _pb_bytes(2, "1"))  # setting
+        # Acknowledges messages we already got, so FCM stops redelivering them.
+        + b"".join(_pb_bytes(10, persistent_id) for persistent_id in received_ids)
+        + _pb_int(12, 0)                                         # adaptive_heartbeat: false
+        + _pb_int(14, 1)                                         # use_rmq2: true
+        + _pb_int(16, 2)                                         # auth_service: ANDROID_ID
+        + _pb_int(17, 1)                                         # network_type
+    )
+    return bytes([MCS_VERSION, TAG_LOGIN_REQUEST]) + _varint(len(payload)) + payload
+
+
+def _take_frame(buffer: bytearray) -> tuple[int, bytes] | None:
+    """Remove one complete `tag, varint size, payload` frame from the buffer."""
+
+    if len(buffer) < 2:
+        return None
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+        size, start = _read_varint(bytes(buffer[1:6]), 0)
+    except PoCError:
+        return None  # size varint not complete yet
+    start += 1
+    if len(buffer) < start + size:
+        return None
+    tag, payload = buffer[0], bytes(buffer[start : start + size])
+    del buffer[: start + size]
+    return tag, payload
+
+
+def _frames(conn: ssl.SSLSocket) -> Iterator[tuple[int, bytes]]:
+    buffer = bytearray()
+    version_checked = False
+    unanswered_pings = 0
+    while True:
+        if not version_checked and buffer:
+            if buffer[0] < MCS_VERSION and buffer[0] != 38:
+                raise PoCError(f"Unsupported MCS version {buffer[0]}")
+            del buffer[0]
+            version_checked = True
+        if version_checked and (frame := _take_frame(buffer)):
+            unanswered_pings = 0
+            yield frame
+            continue
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+            chunk = conn.recv(32768)
+        except TimeoutError:
+            if unanswered_pings >= 2:
+                raise PoCError("FCM connection is silent") from None
+            conn.sendall(bytes([TAG_HEARTBEAT_PING, 0]))
+            unanswered_pings += 1
+            continue
+        if not chunk:
+            raise PoCError("FCM server closed the connection")
+        buffer += chunk
 
 
-def _safe_receiver_line(line: str) -> str:
-    value = _JWT_LIKE.sub("[redacted-jws]", line.strip())
-    value = _LONG_SECRET_LIKE.sub("[redacted]", value)
-    return value[:300]
+def listen(device: FcmDevice) -> Iterator[dict[str, str]]:
+    """Yield the key/value data of every FCM message from Okta's sender, forever.
 
-
-class FcmReceiver:
-    """Run the Android FCM helper until it yields one securely saved JWS."""
-
-    def __init__(
-        self,
-        executable: str | Path,
-        device: str | Path,
-        token_path: str | Path | None = None,
-    ) -> None:
-        self.executable = _executable(executable, "FCM receiver")
-        try:
-            self.device = Path(device).expanduser().resolve(strict=True)
-            info = self.device.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                raise ValidationError("FCM device credential path is not a regular file")
-            if stat.S_IMODE(info.st_mode) & 0o077:
-                raise ValidationError("FCM device credentials must have mode 0600")
-            if not 0 < info.st_size <= 65536:
-                raise ValidationError("FCM device credentials are empty or too large")
-        except OSError as exc:
-            raise ValidationError("FCM device credentials cannot be accessed") from exc
-        self.challenge_path = Path(f"/dev/shm/okta-poc-fcm-challenge-{os.getpid()}.jws")
-        self.token_path = Path(token_path) if token_path is not None else Path(
-            os.environ.get("OKTA_POC_FCM_TOKEN_OUT", "/dev/shm/okta-poc-okta-fcm-token")
-        )
-        self.seen_path = self.device.with_name(self.device.stem + "-seen.json")
-        self._seen_logs: set[str] = set()
-
-    def _environment(self) -> dict[str, str]:
-        environment = {
-            name: value
-            for name, value in os.environ.items()
-            if not name.startswith("OKTA_")
-        }
-        environment.update({
-            "OKTA_POC_FCM_DEVICE": str(self.device),
-            "OKTA_POC_FCM_CHALLENGE_OUT": str(self.challenge_path),
-            "OKTA_POC_FCM_TOKEN_OUT": str(self.token_path),
-            "OKTA_POC_FCM_SEEN": str(self.seen_path),
-        })
-        return environment
-
-    def _read_and_remove_challenge(self) -> str:
-        try:
-            info = self.challenge_path.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                raise ValidationError("FCM challenge path is not a regular file")
-            if stat.S_IMODE(info.st_mode) & 0o077:
-                raise ValidationError("FCM challenge file permissions are too open")
-            if not 0 < info.st_size <= _MAX_CHALLENGE:
-                raise ValidationError("FCM challenge is empty or too large")
-            compact = self.challenge_path.read_text(encoding="ascii").strip()
-        except FileNotFoundError as exc:
-            raise TransportError("FCM receiver reported a challenge without writing it") from exc
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ValidationError("FCM challenge could not be read") from exc
-        finally:
-            self.challenge_path.unlink(missing_ok=True)
-        if not compact:
-            raise ValidationError("FCM challenge is empty")
-        return compact
-
-    def receive(self) -> str:
-        self.challenge_path.unlink(missing_ok=True)
-        try:
-            process = subprocess.Popen(
-                [str(self.executable)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=self._environment(),
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise TransportError("Cannot start FCM receiver") from exc
-        received = False
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                if line.startswith("OKTA_CHALLENGE_RECEIVED"):
-                    received = True
-                    print("FCM challenge received; validating before any decision", flush=True)
-                    break
-                safe = _safe_receiver_line(line)
-                if safe and safe not in self._seen_logs:
-                    self._seen_logs.add(safe)
-                    print(f"FCM receiver: {safe}", flush=True)
-            if not received:
-                status = process.wait()
-                raise TransportError(
-                    f"FCM receiver exited before delivering a challenge (status {status})"
-                )
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                _terminate(process)
-                raise TransportError("FCM receiver did not exit after delivering a challenge")
-            return self._read_and_remove_challenge()
-        except KeyboardInterrupt:
-            _terminate(process)
-            self.challenge_path.unlink(missing_ok=True)
-            raise
-        except Exception:
-            _terminate(process)
-            self.challenge_path.unlink(missing_ok=True)
-            raise
-        finally:
-            if process.stdout is not None:
-                process.stdout.close()
-
-
-def register_fcm_device(
-    executable: str | Path,
-    device: str | Path,
-    token_path: str | Path,
-) -> str:
-    """Create/load Android FCM credentials and return their token securely."""
-
-    resolved = _executable(executable, "FCM receiver")
-    device_path = Path(device).expanduser().resolve()
-    device_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if device_path.exists():
-        info = device_path.lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValidationError("Existing FCM device credentials must be a regular mode-0600 file")
-    token = Path(token_path).expanduser().resolve()
-    if not token.parent.is_dir():
-        raise ValidationError("FCM token output directory does not exist")
-    token.unlink(missing_ok=True)
-    seen = device_path.with_name(device_path.stem + "-seen.json")
-    challenge = Path(f"/dev/shm/okta-poc-fcm-register-{os.getpid()}.jws")
-    challenge.unlink(missing_ok=True)
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith("OKTA_")
-    }
-    environment.update({
-        "OKTA_POC_FCM_DEVICE": str(device_path),
-        "OKTA_POC_FCM_CHALLENGE_OUT": str(challenge),
-        "OKTA_POC_FCM_TOKEN_OUT": str(token),
-        "OKTA_POC_FCM_SEEN": str(seen),
-    })
-    try:
-        process = subprocess.Popen(
-            [str(resolved)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=environment,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise TransportError("Cannot start FCM registration") from exc
-    try:
-        assert process.stdout is not None
-        for line in process.stdout:
-            if line.startswith("FCM token written to"):
-                _terminate(process)
-                try:
-                    info = token.lstat()
-                    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
-                        raise ValidationError("FCM token must be a regular mode-0600 file")
-                    if not 0 < info.st_size <= 16384:
-                        raise ValidationError("FCM token is empty or too large")
-                    value = token.read_text(encoding="ascii").strip()
-                except OSError as exc:
-                    raise TransportError("FCM registration did not create a readable token") from exc
-                if not value:
-                    raise ValidationError("FCM token is empty")
-                return value
-            safe = _safe_receiver_line(line)
-            if safe:
-                print(f"FCM registration: {safe}", flush=True)
-        status = process.wait()
-        raise TransportError(f"FCM registration exited before returning a token (status {status})")
-    except KeyboardInterrupt:
-        _terminate(process)
-        raise
-    except Exception:
-        _terminate(process)
-        raise
-    finally:
-        challenge.unlink(missing_ok=True)
-        if process.stdout is not None:
-            process.stdout.close()
-
-
-def transaction_info(challenge: ValidatedChallenge) -> dict[str, object]:
-    context = challenge.context
-    return {
-        "transactionId": challenge.transaction_id,
-        "enrollmentId": challenge.enrollment_id,
-        "issuer": challenge.issuer,
-        "verificationUri": challenge.verification_uri,
-        "expiresAt": datetime.fromtimestamp(challenge.expires_at, UTC).isoformat(),
-        "transactionType": challenge.transaction_type,
-        "userVerification": challenge.user_verification,
-        "userMediation": challenge.user_mediation,
-        "appInstanceName": challenge.claims.get("appInstanceName"),
-        "clientOS": context.get("clientOS"),
-        "clientLocation": context.get("clientLocation"),
-        "transactionTime": context.get("transactionTime"),
-        "numberMatching": challenge.number_matching,
-        "audienceBound": challenge.audience_bound,
-    }
-
-
-def run_external_decision(
-    executable: str | Path,
-    challenge: ValidatedChallenge,
-) -> Decision:
-    """Return approve/deny/skip from a trusted decision program.
-
-    The program receives one JSON object on stdin. Exit 0 approves, 1 denies,
-    and 2 skips without a response. All other statuses fail closed.
+    Reconnects after errors. While the caller handles a message the socket is
+    not read; if FCM drops us meanwhile we just log in again.
     """
 
-    resolved = _executable(executable, "Decision executable")
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith("OKTA_")
-    }
-    payload = json.dumps(transaction_info(challenge), ensure_ascii=False) + "\n"
-    try:
-        process = subprocess.Popen(
-            [str(resolved)],
-            stdin=subprocess.PIPE,
-            env=environment,
-            text=True,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise PolicyError("Cannot start external decision provider") from exc
-    try:
-        process.communicate(payload)
-    except KeyboardInterrupt:
-        _terminate(process)
-        raise
-    except OSError as exc:
-        _terminate(process)
-        raise PolicyError("External decision provider closed unexpectedly") from exc
-    result = process.returncode
-    if result == 0:
-        return "approve"
-    if result == 1:
-        return "deny"
-    if result == 2:
-        return "skip"
-    raise PolicyError(
-        f"External decision provider returned unsupported exit status {result}; no response was signed"
-    )
-
-
-def interactive_decision() -> Decision:
+    received_ids: list[str] = []
     while True:
         try:
-            answer = input("Decision [a]pprove/[d]eny/[s]kip/[q]uit: ").strip().lower()
-        except EOFError:
-            return "quit"
-        if answer in ("a", "approve"):
-            return "approve"
-        if answer in ("d", "deny"):
-            return "deny"
-        if answer in ("s", "skip"):
-            return "skip"
-        if answer in ("q", "quit"):
-            return "quit"
-        print("Choose a, d, s, or q.")
+            raw = socket.create_connection((MCS_HOST, MCS_PORT), timeout=20)
+            with ssl.create_default_context().wrap_socket(raw, server_hostname=MCS_HOST) as conn:
+                conn.settimeout(HEARTBEAT_SECONDS)
+                conn.sendall(_login_packet(device, received_ids[-100:]))
+                for tag, payload in _frames(conn):
+                    if tag == TAG_HEARTBEAT_PING:
+                        conn.sendall(bytes([TAG_HEARTBEAT_ACK, 0]))
+                    elif tag == TAG_LOGIN_RESPONSE:
+                        if 3 in _pb_parse(payload):
+                            raise PoCError("FCM login was rejected")
+                        print("FCM connected; waiting for pushes", flush=True)
+                    elif tag == TAG_CLOSE:
+                        raise PoCError("FCM server sent close")
+                    elif tag == TAG_DATA_MESSAGE:
+                        message = _pb_parse(payload)
+                        for persistent_id in message.get(9, []):
+                            received_ids.append(persistent_id.decode())
+                        sender = message.get(3, [b""])[0].decode()
+                        if sender != SENDER_ID:
+                            print("Ignoring FCM message from an unexpected sender", flush=True)
+                            continue
+                        data = {}
+                        for item in message.get(7, []):
+                            pair = _pb_parse(item)
+                            data[pair[1][0].decode()] = pair.get(2, [b""])[0].decode()
+                        yield data
+        except (OSError, PoCError) as exc:
+            print(f"FCM connection lost ({exc}); reconnecting in 5 seconds", flush=True)
+            time.sleep(5)
