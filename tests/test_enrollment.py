@@ -126,5 +126,6 @@ def test_delete_and_already_absent():
     assert delete(record, http) == "deleted"
     assert http.calls[0]["method"] == "DELETE"
     assert delete(record, FakeHttp(ApiError(404, "gone", "E0000007"))) == "already absent"
+    assert delete(record, FakeHttp(ApiError(410, "inactive", "E0000154"))) == "already absent"
     with pytest.raises(ApiError):
         delete(record, FakeHttp(ApiError(404, "other", "E0000001")))

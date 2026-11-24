@@ -239,7 +239,8 @@ def delete(enrollment: Enrollment, http: HttpClient) -> str:
             auth=auth_assertion(enrollment, enrollment.enrollment_id), expected=(200, 204),
         )
     except ApiError as exc:
-        if exc.status == 404 and exc.error_code == "E0000007":  # Okta "resource not found"
+        # E0000007: not found; E0000154: no longer active (e.g. replaced by a newer enrollment).
+        if (exc.status, exc.error_code) in ((404, "E0000007"), (410, "E0000154")):
             return "already absent"
         raise
     return "deleted"
