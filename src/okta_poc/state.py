@@ -57,7 +57,7 @@ class Key:
     def _private(self) -> rsa.RSAPrivateKey:
         return serialization.load_pem_private_key(self.private_pem.encode("ascii"), password=None)
 
-    def public_jwk(self) -> dict[str, Any]:
+    def public_jwk(self, *, fips_compliant: bool = False) -> dict[str, Any]:
         # Encoded like the Android app does it: java.math.BigInteger.toByteArray()
         # (signed, so the modulus gets a leading zero byte) and base64url *with*
         # padding. This is the profile proven against a live tenant.
@@ -74,6 +74,11 @@ class Key:
             "alg": "RS256",
             "use": "sig",
             "okta:kpr": "SOFTWARE",
+            # Compatibility declaration, NOT a real FIPS 140-2 claim: these keys are
+            # made by Python's `cryptography`, not a FIPS-validated module. Android
+            # sets this from its crypto provider; FIPS-required tenants reject
+            # enrollment without it (E0000159).
+            "okta:isFipsCompliant": fips_compliant,
         }
 
     def sign(self, claims: dict[str, Any], typ: str) -> str:

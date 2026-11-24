@@ -71,7 +71,12 @@ def test_enroll_request_body_and_record():
 def test_fips_policy_declares_compliance_without_real_fips_crypto():
     http = FakeHttp(enrollment_response())
     record = enroll(policy(fips=True), activation(), http, push_token=None, with_uv=True, display_name="Box")
-    assert http.calls[0]["body"]["methods"][0]["isFipsCompliant"] is True
+    keys = http.calls[0]["body"]["methods"][0]["keys"]
+    assert keys["proofOfPossession"]["okta:isFipsCompliant"] is True
+    assert keys["userVerification"]["okta:isFipsCompliant"] is True
+    assert http.calls[0]["body"]["device"]["clientInstanceKey"]["okta:isFipsCompliant"] is True
+    # Android leaves the method-level flag unset at enroll.
+    assert "isFipsCompliant" not in http.calls[0]["body"]["methods"][0]
     assert record.fips_required is True
     # Non-FIPS tenants keep the body unchanged (no declaration at enroll).
     http = FakeHttp(enrollment_response())

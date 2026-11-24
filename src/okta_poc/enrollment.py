@@ -107,15 +107,12 @@ def _request_body(
     push_token: str | None,
     fips_required: bool = False,
 ) -> dict[str, Any]:
-    keys = {"proofOfPossession": pop_key.public_jwk()}
+    keys = {"proofOfPossession": pop_key.public_jwk(fips_compliant=fips_required)}
     if uv_key:
-        keys["userVerification"] = uv_key.public_jwk()
+        keys["userVerification"] = uv_key.public_jwk(fips_compliant=fips_required)
     method: dict[str, Any] = {"type": "push", "keys": keys}
-    if fips_required:
-        # Compatibility declaration, NOT a real FIPS 140-2 claim: keys are made by
-        # Python's `cryptography`, not a FIPS-validated module. Tenants with
-        # settings.compliance.fips=REQUIRED reject enrollment without it (E0000159).
-        method["isFipsCompliant"] = True
+    # Android's push method leaves supportUserVerification/isFipsCompliant unset at
+    # enroll; FIPS compliance is declared per key ("okta:isFipsCompliant" in the JWK).
     if push_token:
         method["pushToken"] = push_token
     if supports_ciba:
@@ -128,7 +125,7 @@ def _request_body(
         "device": {
             "displayName": display_name,
             **DEVICE_PROFILE,
-            "clientInstanceKey": client_instance_key.public_jwk(),
+            "clientInstanceKey": client_instance_key.public_jwk(fips_compliant=fips_required),
             "deviceAttestation": {},  # empty: no attestation claim
         },
         "methods": [method],

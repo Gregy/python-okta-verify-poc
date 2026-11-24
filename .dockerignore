@@ -16,3 +16,4 @@ live-captures/
 *.keystore
 /*.png
 /*.jpg
+decompiled/

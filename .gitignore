@@ -19,3 +19,6 @@ live-captures/
 # Enrollment QR screenshots (contain activation tokens)
 /*.png
 /*.jpg
+
+# Decompiled APK sources (local reference only, huge)
+decompiled/
