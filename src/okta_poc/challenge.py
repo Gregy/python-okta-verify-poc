@@ -26,6 +26,10 @@ UV_LEVELS = ("PREFERRED", "REQUIRED")
 _SERVER_ID_CHARS = set(string.ascii_letters + string.digits + "_-")
 
 
+class ChallengeExpired(PoCError):
+    """Correctly signed but expired, e.g. an old push FCM delivered again."""
+
+
 @dataclass
 class Challenge:
     transaction_id: str
@@ -132,6 +136,8 @@ class ChallengeValidator:
                     "verify_aud": enrollment.expected_audience is not None,
                 },
             )
+        except jwt.ExpiredSignatureError as exc:
+            raise ChallengeExpired("Challenge has expired") from exc
         except jwt.PyJWTError as exc:
             raise PoCError(f"Challenge rejected: {exc}") from exc
 

@@ -57,7 +57,8 @@ FIREBASE_CLIENT = (
 # MCS protocol
 MCS_VERSION = 41
 TAG_HEARTBEAT_PING, TAG_HEARTBEAT_ACK, TAG_LOGIN_REQUEST, TAG_LOGIN_RESPONSE = 0, 1, 2, 3
-TAG_CLOSE, TAG_DATA_MESSAGE = 4, 8
+TAG_CLOSE, TAG_IQ_STANZA, TAG_DATA_MESSAGE = 4, 7, 8
+SELECTIVE_ACK_EXTENSION = 12
 HEARTBEAT_SECONDS = 300
 
 
@@ -282,31 +283,68 @@ def _take_frame(buffer: bytearray) -> tuple[int, bytes] | None:
     return tag, payload
 
 
-def _frames(conn: ssl.SSLSocket) -> Iterator[tuple[int, bytes]]:
-    buffer = bytearray()
-    version_checked = False
-    unanswered_pings = 0
-    while True:
-        if not version_checked and buffer:
-            if buffer[0] < MCS_VERSION and buffer[0] != 38:
-                raise PoCError(f"Unsupported MCS version {buffer[0]}")
-            del buffer[0]
-            version_checked = True
-        if version_checked and (frame := _take_frame(buffer)):
-            unanswered_pings = 0
-            yield frame
-            continue
-        try:
-            chunk = conn.recv(32768)
-        except TimeoutError:
-            if unanswered_pings >= 2:
-                raise PoCError("FCM connection is silent") from None
-            conn.sendall(bytes([TAG_HEARTBEAT_PING, 0]))
-            unanswered_pings += 1
-            continue
-        if not chunk:
-            raise PoCError("FCM server closed the connection")
-        buffer += chunk
+class _Connection:
+    """One logged-in MCS session.
+
+    Like Chromium, we count the messages the server sent us and report that
+    number (`last_stream_id_received`) in heartbeats and acks; the server
+    uses it to confirm what the client has really received.
+    """
+
+    def __init__(self, device: FcmDevice, received_ids: list[str]) -> None:
+        raw = socket.create_connection((MCS_HOST, MCS_PORT), timeout=20)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=MCS_HOST)
+        self.sock.settimeout(HEARTBEAT_SECONDS)
+        self.sock.sendall(_login_packet(device, received_ids))
+        self.buffer = bytearray()
+        self.version_checked = False
+        self.received = 0
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def send(self, tag: int, payload: bytes = b"") -> None:
+        self.sock.sendall(bytes([tag]) + _varint(len(payload)) + payload)
+
+    def send_heartbeat(self, tag: int) -> None:
+        self.send(tag, _pb_int(2, self.received))  # last_stream_id_received
+
+    def send_ack(self, persistent_ids: list[str]) -> None:
+        """IqStanza with a SelectiveAck: tells FCM to stop redelivering these."""
+
+        selective_ack = b"".join(_pb_bytes(1, persistent_id) for persistent_id in persistent_ids)
+        self.send(
+            TAG_IQ_STANZA,
+            _pb_int(2, 1)                                        # type: SET
+            + _pb_bytes(3, "")                                   # id (required)
+            + _pb_bytes(7, _pb_int(1, SELECTIVE_ACK_EXTENSION) + _pb_bytes(2, selective_ack))
+            + _pb_int(10, self.received),                        # last_stream_id_received
+        )
+
+    def frames(self) -> Iterator[tuple[int, bytes]]:
+        unanswered_pings = 0
+        while True:
+            if not self.version_checked and self.buffer:
+                if self.buffer[0] < MCS_VERSION and self.buffer[0] != 38:
+                    raise PoCError(f"Unsupported MCS version {self.buffer[0]}")
+                del self.buffer[0]
+                self.version_checked = True
+            if self.version_checked and (frame := _take_frame(self.buffer)):
+                self.received += 1
+                unanswered_pings = 0
+                yield frame
+                continue
+            try:
+                chunk = self.sock.recv(32768)
+            except TimeoutError:
+                if unanswered_pings >= 2:
+                    raise PoCError("FCM connection is silent") from None
+                self.send_heartbeat(TAG_HEARTBEAT_PING)
+                unanswered_pings += 1
+                continue
+            if not chunk:
+                raise PoCError("FCM server closed the connection")
+            self.buffer += chunk
 
 
 def listen(device: FcmDevice) -> Iterator[dict[str, str]]:
@@ -318,33 +356,37 @@ def listen(device: FcmDevice) -> Iterator[dict[str, str]]:
 
     received_ids: list[str] = []
     while True:
+        connection = None
         try:
-            raw = socket.create_connection((MCS_HOST, MCS_PORT), timeout=20)
-            with ssl.create_default_context().wrap_socket(raw, server_hostname=MCS_HOST) as conn:
-                conn.settimeout(HEARTBEAT_SECONDS)
-                conn.sendall(_login_packet(device, received_ids[-100:]))
-                for tag, payload in _frames(conn):
-                    if tag == TAG_HEARTBEAT_PING:
-                        conn.sendall(bytes([TAG_HEARTBEAT_ACK, 0]))
-                    elif tag == TAG_LOGIN_RESPONSE:
-                        if 3 in _pb_parse(payload):
-                            raise PoCError("FCM login was rejected")
-                        print("FCM connected; waiting for pushes", flush=True)
-                    elif tag == TAG_CLOSE:
-                        raise PoCError("FCM server sent close")
-                    elif tag == TAG_DATA_MESSAGE:
-                        message = _pb_parse(payload)
-                        for persistent_id in message.get(9, []):
-                            received_ids.append(persistent_id.decode())
-                        sender = message.get(3, [b""])[0].decode()
-                        if sender != SENDER_ID:
-                            print("Ignoring FCM message from an unexpected sender", flush=True)
-                            continue
-                        data = {}
-                        for item in message.get(7, []):
-                            pair = _pb_parse(item)
-                            data[pair[1][0].decode()] = pair.get(2, [b""])[0].decode()
-                        yield data
+            connection = _Connection(device, received_ids[-100:])
+            for tag, payload in connection.frames():
+                if tag == TAG_HEARTBEAT_PING:
+                    connection.send_heartbeat(TAG_HEARTBEAT_ACK)
+                elif tag == TAG_LOGIN_RESPONSE:
+                    if 3 in _pb_parse(payload):
+                        raise PoCError("FCM login was rejected")
+                    print("FCM connected; waiting for pushes", flush=True)
+                elif tag == TAG_CLOSE:
+                    raise PoCError("FCM server sent close")
+                elif tag == TAG_DATA_MESSAGE:
+                    message = _pb_parse(payload)
+                    persistent_ids = [item.decode() for item in message.get(9, [])]
+                    if persistent_ids:
+                        connection.send_ack(persistent_ids)
+                        # Also listed at the next login in case this ack got lost.
+                        received_ids.extend(persistent_ids)
+                    sender = message.get(3, [b""])[0].decode()
+                    if sender != SENDER_ID:
+                        print("Ignoring FCM message from an unexpected sender", flush=True)
+                        continue
+                    data = {}
+                    for item in message.get(7, []):
+                        pair = _pb_parse(item)
+                        data[pair[1][0].decode()] = pair.get(2, [b""])[0].decode()
+                    yield data
         except (OSError, PoCError) as exc:
             print(f"FCM connection lost ({exc}); reconnecting in 5 seconds", flush=True)
             time.sleep(5)
+        finally:
+            if connection:
+                connection.close()

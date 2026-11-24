@@ -37,6 +37,15 @@ def _data_message(sender: str, data: dict[str, str], persistent_id: str) -> byte
     return bytes([fcm.TAG_DATA_MESSAGE]) + fcm._varint(len(payload)) + payload
 
 
+def _acked_ids(packet: bytes) -> tuple[list[str], int]:
+    size, start = fcm._read_varint(packet, 1)
+    iq = fcm._pb_parse(packet[start : start + size])
+    assert iq[2] == [1] and iq[3] == [b""]  # type SET, empty id
+    extension = fcm._pb_parse(iq[7][0])
+    assert extension[1] == [fcm.SELECTIVE_ACK_EXTENSION]
+    return [item.decode() for item in fcm._pb_parse(extension[2][0])[1]], iq[10][0]
+
+
 class FakeConnection:
     """Feeds the MCS stream to `listen` in awkward 3-byte chunks."""
 
@@ -51,6 +60,9 @@ class FakeConnection:
         return False
 
     def settimeout(self, value):
+        pass
+
+    def close(self):
         pass
 
     def sendall(self, data):
@@ -77,7 +89,11 @@ def test_listen_yields_okta_messages_and_answers_heartbeats(monkeypatch, capsys)
     messages = fcm.listen(FcmDevice(android_id=1, security_token=2, token="t"))
     assert next(messages) == {"challenge": "a.b.c", "transactionId": "tx"}
     assert connection.sent[0][:2] == bytes([41, 2])  # login
-    assert bytes([fcm.TAG_HEARTBEAT_ACK, 0]) in connection.sent
+    # Server messages so far: login response (1), ping (2), data (3, 4).
+    heartbeat_ack = bytes([fcm.TAG_HEARTBEAT_ACK]) + fcm._varint(2) + fcm._pb_int(2, 2)
+    assert heartbeat_ack in connection.sent
+    acks = [packet for packet in connection.sent if packet[0] == fcm.TAG_IQ_STANZA]
+    assert [_acked_ids(packet) for packet in acks] == [(["pid-0"], 3), (["pid-1"], 4)]
     assert "unexpected sender" in capsys.readouterr().out
 
 

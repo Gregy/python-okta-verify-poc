@@ -141,3 +141,17 @@ def test_fcm_register_updates_all_enrollments(tmp_path, monkeypatch, http):
     assert cli.main(["--state", str(path), "fcm-register"]) == 0
     assert http.calls[0]["body"]["methods"][0]["pushToken"] == "NEW_TOKEN"
     assert Store(path, None).read().fcm == new_device
+
+
+def test_fcm_ignores_expired_redelivery_quietly(tmp_path, monkeypatch, http, capsys):
+    import time
+
+    server = Server()
+    path = plaintext_state(tmp_path, enrollment())
+    old = {"challenge": server.sign(challenge_claims(exp=int(time.time()) - 3600, iat=int(time.time()) - 3900)),
+           "transactionId": "tx-old"}
+    http.responses = [server.jwks()]
+    assert _run_fcm(monkeypatch, path, [old], "--decision-executable", "/bin/false") == 0
+    output = capsys.readouterr()
+    assert "Ignoring expired push tx-old" in output.out
+    assert output.err == ""

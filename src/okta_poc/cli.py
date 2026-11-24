@@ -11,6 +11,7 @@ from pathlib import Path
 from . import __version__
 from .challenge import (
     Challenge,
+    ChallengeExpired,
     ChallengeValidator,
     challenge_from_envelope,
     poll,
@@ -209,7 +210,11 @@ def _handle_push(
 ) -> str:
     """Validate one FCM message, ask for a decision and answer it. Returns the decision."""
 
-    challenge = validator.validate(challenge_from_envelope(message))
+    try:
+        challenge = validator.validate(challenge_from_envelope(message))
+    except ChallengeExpired:
+        print(f"Ignoring expired push {message.get('transactionId', '')}".rstrip(), flush=True)
+        return "ignored"
     if challenge.transaction_id in handled or challenge.transaction_id in store.read().responded:
         print(f"Ignoring already handled transaction {challenge.transaction_id}", flush=True)
         return "ignored"
