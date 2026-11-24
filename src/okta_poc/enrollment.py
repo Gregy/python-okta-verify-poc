@@ -38,6 +38,7 @@ class Policy:
     expected_audience: str | None
     supports_ciba: bool
     user_verification: str  # NONE / DISCOURAGED / PREFERRED / REQUIRED
+    fips_required: bool = False
 
 
 def _push_method(methods: list[Any]) -> dict[str, Any]:
@@ -92,6 +93,7 @@ def discover(activation: Activation, http: HttpClient, *, allow_missing_audience
         expected_audience=audience,
         supports_ciba="CIBA" in transaction_types,
         user_verification=settings.get("userVerification", "PREFERRED"),
+        fips_required=settings.get("compliance", {}).get("fips") == "REQUIRED",
     )
 
 
@@ -103,11 +105,17 @@ def _request_body(
     client_instance_key: Key,
     uv_key: Key | None,
     push_token: str | None,
+    fips_required: bool = False,
 ) -> dict[str, Any]:
     keys = {"proofOfPossession": pop_key.public_jwk()}
     if uv_key:
         keys["userVerification"] = uv_key.public_jwk()
     method: dict[str, Any] = {"type": "push", "keys": keys}
+    if fips_required:
+        # Compatibility declaration, NOT a real FIPS 140-2 claim: keys are made by
+        # Python's `cryptography`, not a FIPS-validated module. Tenants with
+        # settings.compliance.fips=REQUIRED reject enrollment without it (E0000159).
+        method["isFipsCompliant"] = True
     if push_token:
         method["pushToken"] = push_token
     if supports_ciba:
@@ -144,7 +152,7 @@ def enroll(
     display_name = display_name or socket.gethostname() or "okta-poc"
     body = _request_body(
         policy.authenticator_id, display_name, policy.supports_ciba,
-        pop_key, client_instance_key, uv_key, push_token,
+        pop_key, client_instance_key, uv_key, push_token, policy.fips_required,
     )
     response = http.request(
         "POST", policy.enroll_uri, auth=f"OTDT {activation.token}", json_body=body, expected=(200, 201)
@@ -173,6 +181,7 @@ def enroll(
             ),
             expected_audience=policy.expected_audience,
             policy_supports_ciba=policy.supports_ciba,
+            fips_required=policy.fips_required,
             display_name=display_name,
             pop_key=pop_key,
             client_instance_key=client_instance_key,
@@ -219,7 +228,7 @@ def update_push_token(enrollment: Enrollment, http: HttpClient, push_token: str)
     if enrollment.uv_key:
         # Android's UV-capable update flags UV support explicitly.
         body["methods"][0]["supportUserVerification"] = True
-        body["methods"][0]["isFipsCompliant"] = False
+        body["methods"][0]["isFipsCompliant"] = enrollment.fips_required
     response = http.request(
         "PUT", _enrollment_url(enrollment),
         auth=auth_assertion(enrollment, enrollment.enrollment_id),

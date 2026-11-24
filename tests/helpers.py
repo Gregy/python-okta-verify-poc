@@ -39,7 +39,7 @@ def activation() -> Activation:
     return Activation(token="TEST_ACTIVATION_TOKEN", org_url=ORG, authenticator_id="aut_example")
 
 
-def policy(*, ciba: bool = False, audience: str | None = "0oa_client", uv: str = "PREFERRED") -> Policy:
+def policy(*, ciba: bool = False, audience: str | None = "0oa_client", uv: str = "PREFERRED", fips: bool = False) -> Policy:
     return Policy(
         org_id="00o_org",
         org_url=ORG,
@@ -48,6 +48,7 @@ def policy(*, ciba: bool = False, audience: str | None = "0oa_client", uv: str =
         expected_audience=audience,
         supports_ciba=ciba,
         user_verification=uv,
+        fips_required=fips,
     )
 
 
@@ -55,8 +56,9 @@ def organization_response() -> dict[str, Any]:
     return {"id": "00o_org", "_links": {"organization": {"href": ORG}}}
 
 
-def policy_response(*, ciba: bool = False, protection: str = "ANY", audience: str | None = "0oa_client") -> list[dict[str, Any]]:
+def policy_response(*, ciba: bool = False, protection: str = "ANY", audience: str | None = "0oa_client", fips: bool = False) -> list[dict[str, Any]]:
     settings = {"oauthClientId": audience} if audience else {}
+    settings["compliance"] = {"fips": "REQUIRED" if fips else "ANY"}
     return [
         {
             "id": "aut_example",

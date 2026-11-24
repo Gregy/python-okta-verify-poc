@@ -156,6 +156,8 @@ def cmd_enroll(args: argparse.Namespace) -> None:
         print(f"Device: Android profile, display name {args.display_name or 'from hostname'}")
         print(f"User-verification key: {'yes' if args.with_uv else 'no'}")
         print(f"Push: {'polling only' if args.without_push else 'FCM'}")
+        if policy.fips_required:
+            print("WARNING: policy requires FIPS; declaring isFipsCompliant=true without FIPS-validated crypto (test only)")
         if policy.expected_audience is None:
             print("WARNING: the policy has no OAuth client ID, so challenge audiences cannot be checked")
         _confirm("Enroll now?", args.yes)

@@ -104,6 +104,7 @@ class Enrollment:
     pop_key: Key
     client_instance_key: Key
     uv_key: Key | None = None
+    fips_required: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Enrollment:

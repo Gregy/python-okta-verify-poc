@@ -68,6 +68,17 @@ def test_enroll_request_body_and_record():
     assert record.pending_challenge_uri == ORG + "/api/v1/factors/device-id/lifecycle/pending"
 
 
+def test_fips_policy_declares_compliance_without_real_fips_crypto():
+    http = FakeHttp(enrollment_response())
+    record = enroll(policy(fips=True), activation(), http, push_token=None, with_uv=True, display_name="Box")
+    assert http.calls[0]["body"]["methods"][0]["isFipsCompliant"] is True
+    assert record.fips_required is True
+    # Non-FIPS tenants keep the body unchanged (no declaration at enroll).
+    http = FakeHttp(enrollment_response())
+    enroll(policy(), activation(), http, push_token=None, with_uv=False, display_name="Box")
+    assert "isFipsCompliant" not in http.calls[0]["body"]["methods"][0]
+
+
 def test_enroll_without_push_or_ciba_omits_them():
     http = FakeHttp(enrollment_response())
     record = enroll(policy(), activation(), http, push_token=None, with_uv=False, display_name="Box")
